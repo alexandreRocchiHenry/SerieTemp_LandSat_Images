@@ -10,3 +10,8 @@ try:
         print("Statistiques de la bande 1 :", data.min(), data.max())
 except Exception as e:
     print("Erreur lors de l'ouverture :", e)
+
+with rasterio.open(path) as src:
+    print(src.count, src.width, src.height, src.crs, src.bounds)
+    data = src.read()
+    print(data.shape, data.dtype)

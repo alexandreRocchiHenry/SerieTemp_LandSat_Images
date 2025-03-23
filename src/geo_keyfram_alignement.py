@@ -260,209 +260,142 @@ class GeoKeyFrameAlign:
             })
 
         return pd.DataFrame(results)
-
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import rasterio
 from rasterio.warp import calculate_default_transform, reproject, Resampling
+import geotorch
+
+# --- Your SimpleFeatureNet definition remains unchanged ---
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import geotorch
+import pandas as pd
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import geotorch
+import numpy as np
+import rasterio
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import geotorch
+import numpy as np
+import rasterio
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import geotorch
+import numpy as np
+import rasterio
+
+class SimpleFeatureNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # Conçu pour des images mono-bande : in_channels=1
+        self.conv1 = nn.Conv2d(in_channels=1, out_channels=16, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(in_channels=16, out_channels=32, kernel_size=3, padding=1)
+        self.conv3 = nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, padding=1)
+
+    def forward(self, x):
+        x = F.relu(self.conv1(x))
+        x = F.max_pool2d(x, 2)
+        x = F.relu(self.conv2(x))
+        x = F.max_pool2d(x, 2)
+        x = F.relu(self.conv3(x))
+        return x
 
 class GeoKeyFrameAlignGPUParallel:
-    """
-    Version GPU parallèle utilisant PyTorch pour la détection et le matching de points d’intérêt.
-    La répartition se fait sur plusieurs GPUs via torch.
-    """
     def __init__(self, dst_crs="EPSG:4326", res=None):
-        """
-        Args:
-            dst_crs (str): Code EPSG cible pour reprojection (par défaut EPSG:4326).
-            res (tuple ou None): Résolution souhaitée (ex: (0.0001, 0.0001)).
-        """
         self.dst_crs = dst_crs
         self.res = res
         self.device_count = torch.cuda.device_count()
-        print(f"Nombre de GPUs disponibles : {self.device_count}")
         self.devices = [torch.device(f"cuda:{i}") for i in range(self.device_count)]
+        print(f"Nombre de GPUs disponibles : {self.device_count}")
+        if self.device_count == 0:
+            print("Aucun GPU détecté, utilisation possible du CPU.")
 
-    def load_and_reproject(self, path):
-        with rasterio.open(path) as src:
-            try:
-                data = src.read()
-            except Exception as e:
-                print(f"Erreur lors de la lecture de {path} : {e}")
-                return None
+        self.feature_extractor = SimpleFeatureNet()
+        self.feature_extractor.to(self.devices[0] if self.device_count > 0 else "cpu")
+        # Si GeoTorch >= 0.3.0, on peut activer la contrainte orthogonale :
+        # geotorch.orthogonal(self.feature_extractor.conv1, "weight")
 
-            if data is None:
-                print(f"Aucune donnée lue pour {path}")
-                return None
-
-            if src.crs == self.dst_crs and not self.res:
-                return data
-            else:
-                transform, width, height = calculate_default_transform(
-                    src.crs, self.dst_crs, src.width, src.height, *src.bounds, resolution=self.res
-                )
-
-                dest = np.zeros((src.count, height, width), dtype=src.dtypes[0])
-
-                for i in range(1, src.count + 1):
-                    reproject(
-                        source=rasterio.band(src, i),
-                        destination=dest[i - 1],
-                        src_transform=src.transform,
-                        src_crs=src.crs,
-                        dst_transform=transform,
-                        dst_crs=self.dst_crs,
-                        resampling=Resampling.bilinear
-                    )
-                return dest
-
-    def convert_image_type(self, image):
+    def load_and_reproject(self, image_path):
         """
-        Convertit l'image en uint8 si nécessaire.
+        Lit l'image depuis un GeoTIFF (mono-bande) et la convertit en np.float32.
+        Si souhaité, on peut ajouter une reprojection vers self.dst_crs.
         """
-        if image is None:
-            return None
-        if image.dtype != np.uint8:
-            max_val = image.max() if image.max() != 0 else 1
-            image = (image * (255.0 / max_val)).astype(np.uint8)
-        return image
+        with rasterio.open(image_path) as src:
+            arr = src.read()  # shape: [bands, H, W]
+        arr = arr[0, ...].astype(np.float32)  # On prend la première bande
+        return arr
 
-    def to_grayscale(self, data):
+    def shift_image_tensor(self, t_img, shift):
         """
-        Convertit une image en niveaux de gris.
-        Si l'image a plusieurs canaux, on suppose que les 3 premiers représentent une image couleur.
+        Déplace un tenseur 4D [B, C, H, W] de (shift_x, shift_y) via grid_sample.
         """
-        if data is None:
-            return None
-        if len(data.shape) == 3:
-            C, H, W = data.shape
-            if C == 1:
-                return data[0, :, :]
-            else:
-                rgb = data[:3].transpose(1, 2, 0)
-                gray = np.dot(rgb[..., :3], [0.299, 0.587, 0.114])
-                return gray.astype(data.dtype)
-        return data
+        B, C, H_, W_ = t_img.shape
+        device = t_img.device
 
-    def preprocess(self, data):
+        grid_y, grid_x = torch.meshgrid(
+            torch.arange(H_, dtype=torch.float32, device=device),
+            torch.arange(W_, dtype=torch.float32, device=device),
+            indexing='ij'
+        )
+        shift_x_norm = 2.0 * shift[0] / max(W_ - 1, 1.0)
+        shift_y_norm = 2.0 * shift[1] / max(H_ - 1, 1.0)
+
+        grid_x_norm = (2.0 * grid_x / (W_ - 1)) - 1.0 - shift_x_norm
+        grid_y_norm = (2.0 * grid_y / (H_ - 1)) - 1.0 - shift_y_norm
+
+        grid = torch.stack((grid_x_norm, grid_y_norm), dim=-1).unsqueeze(0)
+        warped = F.grid_sample(t_img, grid, mode='bilinear', padding_mode='zeros', align_corners=True)
+        return warped
+
+    def apply_shift(self, arr_img, shift_params):
         """
-        Applique la conversion en uint8 et en niveaux de gris.
+        Applique (shift_x, shift_y) à une image NumPy en utilisant PyTorch 
+        puis renvoie l'image décalée en NumPy.
         """
-        if data is None:
-            return None
-        data = self.convert_image_type(data)
-        data = self.to_grayscale(data)
-        return data
+        device = self.devices[0] if self.device_count > 0 else "cpu"
+        # Prépare l'image
+        t_img = torch.tensor(arr_img, dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0) / 255.0
+        shift = torch.tensor(shift_params, dtype=torch.float32, device=device)
+        # Warp
+        warped_t = self.shift_image_tensor(t_img, shift)
+        # Retour en NumPy
+        warped_np = (warped_t.squeeze(0).squeeze(0) * 255.0).detach().cpu().numpy()
+        return warped_np
 
-    def detect_keypoints_torch(self, image, device):
+    def calculate_transform_geotorch(self, arr_ref, arr_img, iterations=50, lr=1e-3):
         """
-        Détecte des points d’intérêt et extrait des descripteurs à l’aide de filtres Sobel.
-        Cette implémentation convertit l'image en tenseur, calcule le gradient
-        et sélectionne les 500 points ayant la plus grande magnitude.
-        Pour chaque point, un patch de taille fixe est extrait et aplani.
+        Calcule le décalage optimal entre arr_ref et arr_img 
+        via descente de gradient sur un paramètre shift (x, y).
+        Retourne (shift_x, shift_y), final_loss.
         """
-        if image is None:
-            return [], None
+        device = self.devices[0] if self.device_count > 0 else "cpu"
 
-        tensor_img = torch.from_numpy(image).float().unsqueeze(0).unsqueeze(0).to(device) / 255.0
+        t_ref = torch.tensor(arr_ref, dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0) / 255.0
+        t_img = torch.tensor(arr_img, dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0) / 255.0
 
-        sobel_x = torch.tensor([[[[-1, 0, 1],
-                                   [-2, 0, 2],
-                                   [-1, 0, 1]]]], dtype=torch.float32, device=device)
-        sobel_y = torch.tensor([[[[-1, -2, -1],
-                                   [ 0,  0,  0],
-                                   [ 1,  2,  1]]]], dtype=torch.float32, device=device)
+        shift_param = nn.Parameter(torch.zeros(2, device=device))
+        optimizer = torch.optim.Adam([shift_param], lr=lr)
 
-        grad_x = torch.nn.functional.conv2d(tensor_img, sobel_x, padding=1)
-        grad_y = torch.nn.functional.conv2d(tensor_img, sobel_y, padding=1)
-        grad_mag = torch.sqrt(grad_x ** 2 + grad_y ** 2)
+        for _ in range(iterations):
+            optimizer.zero_grad()
+            warped_img = self.shift_image_tensor(t_img, shift_param)
+            loss = F.l1_loss(t_ref, warped_img)
+            loss.backward()
+            optimizer.step()
 
-        grad_mag_flat = grad_mag.view(-1)
-        num_points = min(500, grad_mag_flat.numel())
-        if num_points == 0:
-            return [], None
-        topk = torch.topk(grad_mag_flat, num_points)
-        indices = topk.indices
-
-        H, W = image.shape
-        y_coords = (indices // W).float()
-        x_coords = (indices % W).float()
-
-        keypoints = [(float(x.item()), float(y.item())) for x, y in zip(x_coords, y_coords)]
-
-        descriptors = []
-        patch_size = 16
-        pad = patch_size // 2
-        padded = torch.nn.functional.pad(tensor_img, (pad, pad, pad, pad), mode='reflect')
-        for (x, y) in keypoints:
-            x_int = int(round(x))
-            y_int = int(round(y))
-            patch = padded[0, 0, y_int:y_int+patch_size, x_int:x_int+patch_size]
-            if patch.shape[0] != patch_size or patch.shape[1] != patch_size:
-                patch = torch.zeros(patch_size, patch_size, device=device)
-            descriptor = patch.flatten()
-            descriptors.append(descriptor)
-        if len(descriptors) == 0:
-            return keypoints, None
-        descriptors = torch.stack(descriptors)
-        return keypoints, descriptors
-
-    def match_keypoints_torch(self, desc1, desc2, ratio=0.75):
-        """
-        Effectue le matching des descripteurs en calculant la distance euclidienne.
-        Pour chaque descripteur de desc1, on sélectionne le meilleur match dans desc2
-        si le ratio entre la première et la deuxième distance est inférieur à 'ratio'.
-        """
-        if desc1 is None or desc2 is None:
-            return []
-        distances = torch.cdist(desc1, desc2, p=2)
-        good_matches = []
-        for i in range(distances.shape[0]):
-            dists = distances[i]
-            sorted_vals, sorted_idx = torch.sort(dists)
-            if sorted_vals[0] < ratio * sorted_vals[1]:
-                match = {'queryIdx': i, 'trainIdx': sorted_idx[0].item(), 'distance': sorted_vals[0].item()}
-                good_matches.append(match)
-        return good_matches
-
-    def calculate_shift_parallel(self, arr_ref, arr_img):
-        """
-        Calcule le décalage entre deux images en utilisant plusieurs GPUs pour la détection.
-        Pour simplifier, l'image de référence est traitée sur tous les GPUs, 
-        mais seul le résultat du premier est utilisé pour le matching avec l'image cible.
-        """
-        if arr_ref is None or arr_img is None:
-            print("Erreur: une des images d'entrée est None, impossible de calculer le décalage.")
-            return None, None, None
-
-        ref = self.preprocess(arr_ref)
-        img = self.preprocess(arr_img)
-        if ref is None or img is None:
-            print("Erreur: le prétraitement a échoué.")
-            return None, None, None
-
-        keypoints_list = []
-        descriptors_list = []
-        for device in self.devices:
-            kp, desc = self.detect_keypoints_torch(ref, device)
-            keypoints_list.append(kp)
-            descriptors_list.append(desc)
-
-        keypoints_ref = keypoints_list[0]
-        descriptors_ref = descriptors_list[0]
-        keypoints_img, descriptors_img = self.detect_keypoints_torch(img, self.devices[0])
-
-        good_matches = self.match_keypoints_torch(descriptors_ref, descriptors_img)
-        if len(good_matches) < 4:
-            return None, None, None
-
-        src_pts = np.float32([keypoints_ref[m['queryIdx']] for m in good_matches])
-        dst_pts = np.float32([keypoints_img[m['trainIdx']] for m in good_matches])
-
-        distances = np.linalg.norm(src_pts - dst_pts, axis=1)
-        mean_shift = np.mean(distances)
-        max_shift = np.max(distances)
-        shift_x = np.mean(src_pts[:, 0] - dst_pts[:, 0])
-        shift_y = np.mean(src_pts[:, 1] - dst_pts[:, 1])
-
-        return mean_shift, max_shift, (shift_x, shift_y)
+        shift_final = shift_param.detach().cpu().numpy()
+        return tuple(shift_final), float(loss.item())
