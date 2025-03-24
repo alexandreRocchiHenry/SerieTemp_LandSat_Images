@@ -71,13 +71,6 @@ default_augmentation_fn = albumentations_sequence_transform
 # Fonction pour appliquer le recalage sur une image multi-canaux (CPU uniquement)
 ###############################################################################
 def apply_shift_multi_channel(arr_img, shift_params):
-    """
-    Applique le décalage (shift_x, shift_y) sur une image multi-canaux.
-    arr_img : np.array de shape [C, H, W]
-    shift_params : tuple (shift_x, shift_y)
-    Utilise le CPU pour éviter de ré-initialiser CUDA dans les workers.
-    Retourne l'image recalée de même shape [C, H, W].
-    """
     device = "cpu"
     t_img = torch.tensor(arr_img, dtype=torch.float32, device=device).unsqueeze(0) / 255.0
     B, C, H, W = t_img.shape
@@ -108,11 +101,11 @@ class TemporalSatDataset(Dataset):
          * Convertir chaque bande en booléen (True si pixel == 255).
          * Calculer le nombre de classes actives par pixel.
          * Calculer la fréquence globale pour chaque classe dans l'image.
-         * Pour un pixel avec plusieurs classes actives, choisir la classe rare (celle dont le nombre total de pixels actifs est le plus faible).
+         * Pour un pixel avec plusieurs classes actives, choisir la classe rare.
          * Pour les pixels sans aucune classe active, assigner 255.
-    - Regroupement par "key" (colonne du CSV) et tri par date.
-    - Recalage appliqué via un CSV d'alignement (déjà généré).
-    - Sélection intelligente du sous-intervalle temporel : on choisit celui avec le maximum d'annotations.
+    - Regroupement par "key" et tri par date.
+    - Recalage via un CSV d'alignement.
+    - Sélection du sous-intervalle temporel garantissant au moins une annotation.
     """
     def __init__(self,
                  csv_path,
@@ -120,14 +113,6 @@ class TemporalSatDataset(Dataset):
                  transform_fn=default_augmentation_fn,
                  seq_length=None,
                  random_subseq=True):
-        """
-        Args:
-          csv_path      : Chemin vers df_merged.csv (doit contenir une colonne "key").
-          alignment_csv : Chemin vers le CSV de recalage.
-          transform_fn  : Fonction de data augmentation (pour la séquence entière).
-          seq_length    : Nombre de frames à retourner (sinon toute la séquence).
-          random_subseq : Si True, sélectionne un sous-intervalle avec le maximum d'annotations.
-        """
         super().__init__()
         self.df = pd.read_csv(csv_path)
         self.df = self.df[self.df['planet_path'].apply(os.path.exists)].reset_index(drop=True)
@@ -170,39 +155,27 @@ class TemporalSatDataset(Dataset):
         return len(self.grouped_key)
 
     def select_subsequence(self, seq):
-        """
-        Sélection intelligente d'un sous-intervalle de longueur seq_length
-        en choisissant celui avec le maximum de frames annotées.
-        Si aucun intervalle ne contient d'annotations, renvoie un intervalle aléatoire.
-        """
         T_all = len(seq)
         if self.seq_length is None or self.seq_length >= T_all:
+            if not any(info["labels_path"] is not None and os.path.exists(info["labels_path"]) for info in seq):
+                raise ValueError("La séquence ne contient aucune annotation.")
             return seq
-        best_interval = None
-        best_count = -1
-        for start in range(0, T_all - self.seq_length + 1):
-            interval = seq[start:start+self.seq_length]
-            count = sum(1 for item in interval if item["labels_path"] is not None and os.path.exists(item["labels_path"]))
-            if count > best_count:
-                best_count = count
-                best_interval = interval
-        if best_interval is not None and best_count > 0:
-            return best_interval
+
+        annotated_indices = [i for i, info in enumerate(seq)
+                             if info["labels_path"] is not None and os.path.exists(info["labels_path"])]
+        if not annotated_indices:
+            raise ValueError("La séquence ne contient aucune annotation.")
+
+        chosen_idx = random.choice(annotated_indices)
+        start_min = max(0, chosen_idx - self.seq_length + 1)
+        start_max = min(chosen_idx, T_all - self.seq_length)
+        if start_max < start_min:
+            start = start_min
         else:
-            start = random.randint(0, T_all - self.seq_length)
-            return seq[start:start+self.seq_length]
+            start = random.randint(start_min, start_max)
+        return seq[start:start+self.seq_length]
 
     def __getitem__(self, index):
-        """
-        Renvoie un dictionnaire contenant :
-          "X": tenseur [T, 4, H, W] recalé et transformé,
-          "Y": tenseur [T, H, W] (masque d'indices de classe) où
-               - -1 signifie pas d'annotation,
-               - 255 signifie pixel sans aucune classe active,
-               - sinon l'indice de la classe choisie (en cas de conflit, la classe rare est choisie).
-          "mask_superv": booléen [T] indiquant si la frame est annotée,
-          "key": identifiant de la zone.
-        """
         item = self.grouped_key[index]
         key_val = item["key"]
         seq_meta = item["sequence"]
@@ -211,14 +184,16 @@ class TemporalSatDataset(Dataset):
             chosen_meta = self.select_subsequence(seq_meta)
         else:
             chosen_meta = seq_meta
+            if not any(info["labels_path"] is not None and os.path.exists(info["labels_path"]) for info in chosen_meta):
+                raise ValueError(f"La séquence pour key {key_val} ne contient aucune annotation.")
+
         T = len(chosen_meta)
-        
         list_img = []
         list_mask = []
         for info in chosen_meta:
             planet_path = info["planet_path"]
             labels_path = info["labels_path"]
-            arr = read_tiff(planet_path).astype(np.float32)  # [4, H, W]
+            arr = read_tiff(planet_path).astype(np.float32)
             base_name = os.path.basename(planet_path)
             zone_path = os.path.dirname(planet_path)
             align_key = (zone_path, base_name)
@@ -229,8 +204,9 @@ class TemporalSatDataset(Dataset):
             
             if labels_path is not None and os.path.exists(labels_path):
                 try:
-                    label_8bands = read_tiff(labels_path)  # [8, H, W] avec 0 ou 255
-                except Exception:
+                    label_8bands = read_tiff(labels_path)
+                except Exception as e:
+                    print(f"[DEBUG] Erreur de lecture du label pour {labels_path}: {e}")
                     mask_data = None
                 else:
                     bin_mask = (label_8bands == 255)
@@ -260,19 +236,19 @@ class TemporalSatDataset(Dataset):
                 Y_list.append(None)
         X = torch.stack(X_list, dim=0)  # [T, 4, H, W]
         T, _, H, W = X.shape
-        Y = torch.full((T, H, W), fill_value=-1, dtype=torch.long)
+        # Modification : utilisation de 255 comme valeur par défaut pour les pixels non annotés
+        Y = torch.full((T, H, W), fill_value=255, dtype=torch.long)
         mask_superv = torch.zeros((T,), dtype=torch.bool)
         for t in range(T):
             if Y_list[t] is not None:
                 Y[t] = Y_list[t]
                 mask_superv[t] = True
-        sample = {"X": X, "Y": Y, "mask_superv": mask_superv, "key": key_val}
 
-        # Normalize for ResNet50 (Planet‑specific mean/std)
-        mean = torch.tensor([1042.59,  915.62,  671.26, 2605.21], dtype=torch.float32, device=X.device)
-        std  = torch.tensor([ 957.96,  715.55,  596.94, 1059.90], dtype=torch.float32, device=X.device)
-        # X shape = [T, 4, H, W] → normalize channel‑wise
+        print(f"[DEBUG] Key: {key_val} | Sequence length: {T} | Annotated frames: {mask_superv.sum().item()}")
+
+        sample = {"X": X, "Y": Y, "mask_superv": mask_superv, "key": key_val}
+        mean = torch.tensor([1042.59, 915.62, 671.26, 2605.21], dtype=torch.float32, device=X.device)
+        std  = torch.tensor([957.96, 715.55, 596.94, 1059.90], dtype=torch.float32, device=X.device)
         X = (X - mean.view(1, -1, 1, 1)) / std.view(1, -1, 1, 1)
         sample["X"] = X
-        # -----------------------------------------
         return sample

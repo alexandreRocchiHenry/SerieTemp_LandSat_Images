@@ -9,7 +9,12 @@ from dataloader_sat_image import TemporalSatDataset, default_augmentation_fn
 from loss_sat_images import temporal_semi_supervised_loss
 from model_deeplabv3_plus import TemporalPlanetDeepLab
 
-# Paths & hyperparameters
+def print_debug_info(batch, preds, loss):
+    X, Y, sup_mask = batch["X"], batch["Y"], batch["mask_superv"]
+    print(f"[DEBUG] Batch shapes -> X: {X.shape}, Y: {Y.shape}, mask_superv: {sup_mask.shape}")
+    print(f"[DEBUG] Preds shape: {preds.shape}, Loss: {loss.item():.4f}")
+
+# Paths & hyperparamètres
 CSV_PATH      = "dataframe/df_merged_expanded.csv"
 ALIGNMENT_CSV = "dataframe/keyframes_alignment_geotorch.csv"
 BATCH_SIZE    = 8
@@ -33,58 +38,73 @@ loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True,
 
 # Model + optimizer
 model = TemporalPlanetDeepLab(num_classes=NUM_CLASSES).to(DEVICE)
+# Au départ, on gèle l'encodeur et le convlstm,
+# MAIS on dé-gèle dès le début la tête de classification.
 for param in model.encoder.parameters():
     param.requires_grad = False
-optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=LR)
+for param in model.convlstm.parameters():
+    param.requires_grad = False
+for param in model.classifier.parameters():
+    param.requires_grad = True  # Dé-gel immédiat de la tête de classification
 
-unfreeze_epochs = [15, 30, 45]
+optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=LR)
+# Déblocage progressif prévu :
+unfreeze_epochs = {
+    "convlstm": 15,
+    "encoder": 30
+}
 
 print("Starting training")
 for epoch in range(1, NUM_EPOCHS + 1):
     model.train()
     running_loss = 0.0
-
-    # Progressive unfreeze
-    if epoch == unfreeze_epochs[0]:
-        print("Unfreezing classifier head")
-        for p in model.classifier.parameters(): p.requires_grad = True
-        optimizer.add_param_group({"params": model.classifier.parameters(), "lr": LR})
-
-    if epoch == unfreeze_epochs[1]:
-        print("Unfreezing ConvLSTM")
-        for p in model.convlstm.parameters(): p.requires_grad = True
+    print(f"[DEBUG] Epoch {epoch} start")
+    
+    # Déblocage progressif pour convlstm et encoder
+    if epoch == unfreeze_epochs["convlstm"]:
+        print("[DEBUG] Unfreezing ConvLSTM")
+        for p in model.convlstm.parameters():
+            p.requires_grad = True
         optimizer.add_param_group({"params": model.convlstm.parameters(), "lr": LR})
-
-    if epoch == unfreeze_epochs[2]:
-        print("Unfreezing full backbone")
-        for p in model.encoder.parameters(): p.requires_grad = True
+    if epoch == unfreeze_epochs["encoder"]:
+        print("[DEBUG] Unfreezing full backbone (encoder)")
+        for p in model.encoder.parameters():
+            p.requires_grad = True
         optimizer.add_param_group({"params": model.encoder.parameters(), "lr": LR * 0.1})
-
+    
     loop = tqdm(loader, desc=f"Epoch {epoch}/{NUM_EPOCHS}", unit="batch")
     for batch in loop:
-        X = batch["X"].to(DEVICE)  # shape actuelle [T, B, C, H, W]
-        Y = batch["Y"].to(DEVICE)
-        sup_mask = batch["mask_superv"].to(DEVICE)           
-        X = X.permute(1, 0, 2, 3, 4)            # → [B, T, C, H, W]
+        # Debug: nombre de frames annotées dans le batch
+        num_annotated = batch["mask_superv"].sum().item()
+        total_frames = batch["mask_superv"].numel()
+        print(f"[DEBUG] Batch contains {num_annotated} annotated frames out of {total_frames} total frames.")
 
-        preds = model(X)  # [B, C, H, W]
+        X = batch["X"].to(DEVICE)    # [B, T, 4, H, W]
+        Y = batch["Y"].to(DEVICE)    # [B, T, H, W]
+        sup_mask = batch["mask_superv"].to(DEVICE)  # [B, T]
+
+        # Forward pass (le modèle renvoie des logits de forme [T, B, C, H, W] ou [B, T, C, H, W])
         preds = model(X)
-        print("DEBUG — preds.shape =", preds.shape)
-
+        
         loss = temporal_semi_supervised_loss(
             preds,
-            {"Y": Y[:, -1], "mask_superv": sup_mask[:, -1]},
-            lambda_temp=1.0, lambda_dice=1.0, lambda_focal=0.0, num_classes=NUM_CLASSES
+            {"Y": Y, "mask_superv": sup_mask},
+            lambda_temp=1.0, lambda_dice=1.0, lambda_focal=0.0,
+            num_classes=NUM_CLASSES
         )
 
+        if loss.grad_fn is None:
+            print("[WARNING] Loss is not differentiable!")
+            
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
         running_loss += loss.item()
         loop.set_postfix(loss=running_loss / (loop.n + 1))
+        print_debug_info(batch, preds, loss)
 
-    print(f"Epoch {epoch} completed — Avg Loss: {running_loss/len(loader):.4f}")
+    print(f"[DEBUG] Epoch {epoch} completed — Avg Loss: {running_loss/len(loader):.4f}")
 
 print("Training finished, saving model")
 os.makedirs("models", exist_ok=True)
