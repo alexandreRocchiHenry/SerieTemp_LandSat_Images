@@ -39,18 +39,19 @@ class MetricsEvaluator:
             self._update_frame(pred, target)
 
     def _update_frame(self, pred, target):
-        # On ne considère que les pixels valides (target != ignore_index)
         valid_mask = (target != self.ignore_index)
         if valid_mask.sum() == 0:
-            return  # Aucun pixel valide dans cette frame
+            return
         pred_valid = pred[valid_mask]
         target_valid = target[valid_mask]
         self.total_correct += (pred_valid == target_valid).sum()
         self.total_valid += valid_mask.sum()
-        # Mise à jour de la matrice de confusion
-        for i in range(self.num_classes):
-            for j in range(self.num_classes):
-                self.confusion_matrix[i, j] += np.logical_and(target_valid == i, pred_valid == j).sum()
+        
+        # Utiliser np.bincount pour construire la matrice de confusion
+        inds = self.num_classes * target_valid + pred_valid
+        cm_update = np.bincount(inds, minlength=self.num_classes**2).reshape(self.num_classes, self.num_classes)
+        self.confusion_matrix += cm_update
+
     
     def update_temporal(self, pred_seq):
         """

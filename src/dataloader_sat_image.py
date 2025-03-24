@@ -2,10 +2,10 @@
 # -*- coding: utf-8 -*-
 """
 DataLoader semi-supervisé pour séries temporelles d’images satellites (4 bandes : RGB+NIR)
-avec recalage appliqué via un CSV de keyframes et conversion des masques multi‑canaux (8 bandes binaires)
+avec recalage via un CSV de keyframes et conversion des masques multi‑canaux (8 bandes binaires)
 en masque d'indices de classes. La data augmentation est réalisée avec Albumentations,
 appliquée de façon identique à toute la séquence.
-À placer dans src/temporal_sat_dataset.py
+Le split (train, val, test) est réalisé directement dans le code en se basant sur la colonne "key".
 """
 
 import os
@@ -15,7 +15,7 @@ import pandas as pd
 import torch
 import rasterio
 from datetime import datetime
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 import torch.nn.functional as F
 from functools import lru_cache
 from tqdm import tqdm
@@ -36,9 +36,8 @@ def read_tiff(path):
 def albumentations_sequence_transform(list_img, list_mask=None):
     """
     Applique une transformation Albumentations identique à toutes les frames d'une séquence.
-    Les images sont supposées au format [C, H, W] (ici 4 canaux). On les convertit en HWC,
-    on applique la transformation, puis on retransforme en CHW.
-    La même transformation (fixée par un seed commun) est appliquée à chaque frame.
+    Les images sont au format [C, H, W]. On les convertit en HWC, on applique la transformation,
+    puis on retransforme en CHW.
     """
     transform = A.Compose([
          A.HorizontalFlip(p=0.5),
@@ -65,7 +64,37 @@ def albumentations_sequence_transform(list_img, list_mask=None):
             
     return augmented_imgs, augmented_masks
 
+def validation_transform(list_img, list_mask=None):
+    """
+    Applique une transformation déterministe (ici un center crop à 512x512)
+    à toutes les frames d'une séquence pour la validation ou le test.
+    Les images sont supposées au format [C, H, W]. On les convertit en HWC de manière contiguë,
+    on applique la transformation, puis on retransforme en CHW.
+    """
+    transform = A.Compose([
+         A.CenterCrop(width=512, height=512, p=1.0),
+    ], additional_targets={'mask': 'mask'})
+    
+    augmented_imgs = []
+    augmented_masks = [] if list_mask is not None else None
+
+    for idx, img in enumerate(list_img):
+        # Convertir en HWC et forcer la contiguïté
+        img_hwc = np.ascontiguousarray(np.transpose(img, (1, 2, 0)))
+        mask = None
+        if list_mask is not None and list_mask[idx] is not None:
+            mask = np.ascontiguousarray(list_mask[idx])
+        augmented = transform(image=img_hwc, mask=mask)
+        aug_img = np.transpose(augmented['image'], (2, 0, 1))
+        augmented_imgs.append(aug_img)
+        if list_mask is not None:
+            augmented_masks.append(augmented['mask'])
+            
+    return augmented_imgs, augmented_masks
+
+
 default_augmentation_fn = albumentations_sequence_transform
+validation_fn = validation_transform
 
 ###############################################################################
 # Fonction pour appliquer le recalage sur une image multi-canaux (CPU uniquement)
@@ -95,26 +124,26 @@ class TemporalSatDataset(Dataset):
     """
     Dataset pour séries temporelles d’images satellites avec recalage.
     
-    - Images en 4 bandes (RGB+NIR).
-    - Masques en 8 bandes binaires (une bande par classe) avec pixels à 0 ou 255.
-      La conversion en masque d'indices de classes se fait ainsi :
-         * Convertir chaque bande en booléen (True si pixel == 255).
-         * Calculer le nombre de classes actives par pixel.
-         * Calculer la fréquence globale pour chaque classe dans l'image.
-         * Pour un pixel avec plusieurs classes actives, choisir la classe rare.
-         * Pour les pixels sans aucune classe active, assigner 255.
-    - Regroupement par "key" et tri par date.
-    - Recalage via un CSV d'alignement.
-    - Sélection du sous-intervalle temporel garantissant au moins une annotation.
+    Les images proviennent de 4 bandes (RGB+NIR) et les masques sont des TIFF à 8 bandes
+    (chaque bande vaut 0 ou 255). La conversion se fait pour obtenir un masque à une
+    seule classe par pixel, avec 255 indiquant l'absence d'annotation.
+    
+    Le split (train, val, test) est réalisé dans le code en se basant sur la colonne "key".
     """
     def __init__(self,
                  csv_path,
                  alignment_csv,
                  transform_fn=default_augmentation_fn,
                  seq_length=None,
-                 random_subseq=True):
+                 random_subseq=True,
+                 split='train',           # 'train', 'val' ou 'test'
+                 train_ratio=0.7,
+                 val_ratio=0.15,
+                 test_ratio=0.15,
+                 split_seed=42):
         super().__init__()
         self.df = pd.read_csv(csv_path)
+        # Conserver uniquement les lignes dont le chemin existe
         self.df = self.df[self.df['planet_path'].apply(os.path.exists)].reset_index(drop=True)
         for col in ["key", "date", "planet_path"]:
             if col not in self.df.columns:
@@ -122,9 +151,28 @@ class TemporalSatDataset(Dataset):
         if "labels_path" not in self.df.columns:
             self.df["labels_path"] = None
 
+        # Split sur la base de la clé sans modifier le CSV
+        unique_keys = self.df["key"].unique()
+        rng = np.random.default_rng(split_seed)
+        rng.shuffle(unique_keys)
+        n = len(unique_keys)
+        n_train = int(train_ratio * n)
+        n_val = int(val_ratio * n)
+        if split == 'train':
+            selected_keys = unique_keys[:n_train]
+        elif split == 'val':
+            selected_keys = unique_keys[n_train:n_train+n_val]
+        elif split == 'test':
+            selected_keys = unique_keys[n_train+n_val:]
+        else:
+            raise ValueError("split doit être 'train', 'val' ou 'test'.")
+
+        self.df = self.df[self.df["key"].isin(selected_keys)].reset_index(drop=True)
+        
+        # Conversion de la date
         self.df["date_dt"] = pd.to_datetime(self.df["date"], format="%Y-%m-%d")
         
-        # Groupement par "key" et tri par date
+        # Groupement par "key" et tri chronologique
         self.grouped_key = []
         for key_val, group in self.df.groupby("key"):
             group_sorted = group.sort_values("date_dt")
@@ -144,16 +192,16 @@ class TemporalSatDataset(Dataset):
         self.seq_length = seq_length
         self.random_subseq = random_subseq
         
-        # Charger le CSV d'alignement et construire un dictionnaire
+        # Chargement du CSV d'alignement
         self.alignment_dict = {}
         df_align = pd.read_csv(alignment_csv)
         for idx, row in df_align.iterrows():
             align_key = (row["zone_path"], row["image_name"])
             self.alignment_dict[align_key] = (row["shift_x"], row["shift_y"])
-
+    
     def __len__(self):
         return len(self.grouped_key)
-
+    
     def select_subsequence(self, seq):
         T_all = len(seq)
         if self.seq_length is None or self.seq_length >= T_all:
@@ -165,50 +213,61 @@ class TemporalSatDataset(Dataset):
                              if info["labels_path"] is not None and os.path.exists(info["labels_path"])]
         if not annotated_indices:
             raise ValueError("La séquence ne contient aucune annotation.")
-
         chosen_idx = random.choice(annotated_indices)
         start_min = max(0, chosen_idx - self.seq_length + 1)
         start_max = min(chosen_idx, T_all - self.seq_length)
-        if start_max < start_min:
-            start = start_min
-        else:
-            start = random.randint(start_min, start_max)
+        start = start_min if start_max < start_min else random.randint(start_min, start_max)
         return seq[start:start+self.seq_length]
-
+    
     def __getitem__(self, index):
+  
         item = self.grouped_key[index]
         key_val = item["key"]
+        
         seq_meta = item["sequence"]
         
-        if self.random_subseq and self.seq_length is not None:
-            chosen_meta = self.select_subsequence(seq_meta)
+        # Au début de __getitem__, juste après avoir récupéré seq_meta et annotated
+        if self.seq_length is not None:
+            if self.random_subseq:
+                chosen_meta = self.select_subsequence(seq_meta)
+            else:
+                start = (len(seq_meta) - self.seq_length) // 2
+                chosen_meta = seq_meta[start : start + self.seq_length]
         else:
             chosen_meta = seq_meta
-            if not any(info["labels_path"] is not None and os.path.exists(info["labels_path"]) for info in chosen_meta):
-                raise ValueError(f"La séquence pour key {key_val} ne contient aucune annotation.")
 
+            if not any(info["labels_path"] is not None and os.path.exists(info["labels_path"]) for info in chosen_meta):
+                raise ValueError(f"[DEBUG __getitem__] La séquence pour key {key_val} ne contient aucune annotation.")
+        
+        
         T = len(chosen_meta)
         list_img = []
         list_mask = []
-        for info in chosen_meta:
+        for idx, info in enumerate(chosen_meta):
+            
             planet_path = info["planet_path"]
             labels_path = info["labels_path"]
+
             arr = read_tiff(planet_path).astype(np.float32)
             base_name = os.path.basename(planet_path)
             zone_path = os.path.dirname(planet_path)
             align_key = (zone_path, base_name)
             if align_key in self.alignment_dict:
                 shift_params = self.alignment_dict[align_key]
+                
                 arr = apply_shift_multi_channel(arr, shift_params)
             list_img.append(arr)
             
             if labels_path is not None and os.path.exists(labels_path):
+
                 try:
                     label_8bands = read_tiff(labels_path)
                 except Exception as e:
-                    print(f"[DEBUG] Erreur de lecture du label pour {labels_path}: {e}")
+                   
                     mask_data = None
                 else:
+
+                    # Création du masque d'indice unique à partir des 8 bandes
                     bin_mask = (label_8bands == 255)
                     count_per_pixel = bin_mask.sum(axis=0)
                     global_counts = bin_mask.sum(axis=(1,2)).astype(np.float32) + 1e-6
@@ -218,15 +277,19 @@ class TemporalSatDataset(Dataset):
                     class_indices[no_class] = 255
                     mask_data = class_indices.astype(np.uint8)
             else:
+               
                 mask_data = None
             list_mask.append(mask_data)
-            
+        
         if self.transform_fn is not None:
+
             list_img, list_mask = self.transform_fn(list_img, list_mask)
-            
+          
+        
         X_list = []
         Y_list = []
         for i in range(T):
+
             x_t = torch.from_numpy(list_img[i])
             X_list.append(x_t)
             if list_mask[i] is not None:
@@ -236,15 +299,14 @@ class TemporalSatDataset(Dataset):
                 Y_list.append(None)
         X = torch.stack(X_list, dim=0)  # [T, 4, H, W]
         T, _, H, W = X.shape
-        # Modification : utilisation de 255 comme valeur par défaut pour les pixels non annotés
+
+        # Initialiser Y avec 255 (ignore_index) pour les pixels non annotés
         Y = torch.full((T, H, W), fill_value=255, dtype=torch.long)
         mask_superv = torch.zeros((T,), dtype=torch.bool)
         for t in range(T):
             if Y_list[t] is not None:
                 Y[t] = Y_list[t]
                 mask_superv[t] = True
-
-        print(f"[DEBUG] Key: {key_val} | Sequence length: {T} | Annotated frames: {mask_superv.sum().item()}")
 
         sample = {"X": X, "Y": Y, "mask_superv": mask_superv, "key": key_val}
         mean = torch.tensor([1042.59, 915.62, 671.26, 2605.21], dtype=torch.float32, device=X.device)
