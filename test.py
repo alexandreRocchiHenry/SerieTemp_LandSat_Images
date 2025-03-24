@@ -62,14 +62,18 @@ for epoch in range(1, NUM_EPOCHS + 1):
 
     loop = tqdm(loader, desc=f"Epoch {epoch}/{NUM_EPOCHS}", unit="batch")
     for batch in loop:
-        X = batch["X"].to(DEVICE)
+        X = batch["X"].to(DEVICE)  # shape actuelle [T, B, C, H, W]
         Y = batch["Y"].to(DEVICE)
-        sup_mask = batch["mask_superv"].to(DEVICE)
+        sup_mask = batch["mask_superv"].to(DEVICE)           
+        X = X.permute(1, 0, 2, 3, 4)            # → [B, T, C, H, W]
 
+        preds = model(X)  # [B, C, H, W]
         preds = model(X)
+        print("DEBUG — preds.shape =", preds.shape)
+
         loss = temporal_semi_supervised_loss(
-            preds.unsqueeze(0),
-            {"Y": Y[:, -1].unsqueeze(0), "mask_superv": sup_mask[:, -1].unsqueeze(0)},
+            preds,
+            {"Y": Y[:, -1], "mask_superv": sup_mask[:, -1]},
             lambda_temp=1.0, lambda_dice=1.0, lambda_focal=0.0, num_classes=NUM_CLASSES
         )
 

@@ -40,7 +40,16 @@ class TemporalPlanetDeepLab(nn.Module):
 
         layer_outputs, _ = self.convlstm(feats_seq)
         output = layer_outputs[0]                                              # [T, B, hidden, h, w]
-        last = output[-1]                                                       # [B, hidden, h, w]
+        # Appliquer le classifier à chaque timestep
+        # Appliquer le classifier à chaque timestep
+        logits_seq = [self.classifier(frame) for frame in output]      # liste de [B, C, h, w]
+        logits_seq = torch.stack(logits_seq, dim=0)                     # [T, B, C, h, w]
 
-        logits = self.classifier(last)                                          # [B, num_classes, h, w]
-        return F.interpolate(logits, size=(H, W), mode="bilinear", align_corners=False)
+        # Fusionner T et B pour l'interpolation
+        T, B, C, h, w = logits_seq.shape
+        logits_seq = logits_seq.view(T * B, C, h, w)                    # [T*B, C, h, w]
+        logits_seq = F.interpolate(logits_seq, size=(H, W), align_corners=True, mode="bilinear")
+        logits_seq = logits_seq.view(T, B, C, H, W)                     # → [T, B, C, H, W]
+
+        return logits_seq
+

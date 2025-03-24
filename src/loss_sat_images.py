@@ -67,42 +67,38 @@ def focal_loss_frame(pred, target, alpha=0.25, gamma=2.0, ignore_index=255):
     return loss.sum() / valid_mask.sum()
 
 def temporal_semi_supervised_loss(preds, sample, lambda_temp=1.0, lambda_dice=1.0, lambda_focal=0.0, num_classes=8):
-    """
-    Accepts preds of shape [B, C, H, W] or [T, C, H, W].
-    Converts single-frame outputs into time-first shape automatically.
-    """
-    # If model returned [B, C, H, W], add a time dimension
+    # Si preds est 4D → on ajoute la dimension temporelle
     if preds.ndim == 4:
-        preds = preds.unsqueeze(0)  # → [1, C, H, W]
-        sample = {
-            "Y": sample["Y"].unsqueeze(0),
-            "mask_superv": sample["mask_superv"].unsqueeze(0)
-        }
+        preds = preds.unsqueeze(0)  # [1, B, C, H, W]
+        mask_superv = sample["mask_superv"].unsqueeze(0)  # [1, B]
+        Y = sample["Y"].unsqueeze(0)                       # [1, B, H, W]
+    else:
+        preds = preds  # [T, B, C, H, W]
+        mask_superv = sample["mask_superv"]  # [T, B]
+        Y = sample["Y"]                      # [T, B, H, W]
 
-    T, C, H, W = preds.shape
-    Y = sample["Y"]
-    mask_superv = sample["mask_superv"]
+    T, B, C, H, W = preds.shape
 
     supervised_ce = supervised_dice = supervised_focal = 0.0
     annotated_frames = 0
 
     for t in range(T):
-        if mask_superv[t]:
-            supervised_ce += F.cross_entropy(preds[t].unsqueeze(0), Y[t].unsqueeze(0), ignore_index=255)
-            pred_soft = torch.softmax(preds[t], dim=0)
-            supervised_dice += dice_loss_frame(pred_soft, Y[t], num_classes, ignore_index=255)
-            supervised_focal += focal_loss_frame(preds[t], Y[t], ignore_index=255)
-            annotated_frames += 1
+        valid = mask_superv[t]
+        if valid.any():
+            preds_t = preds[t][valid]                     # [n_valid, C, H, W]
+            Y_t = Y[t][valid]                             # [n_valid, H, W]
+            supervised_ce += F.cross_entropy(preds_t, Y_t, ignore_index=255)
+            pred_soft = torch.softmax(preds[t], dim=1)
+            for i in range(preds_t.shape[0]):
+                supervised_dice += dice_loss_frame(pred_soft[valid][i], Y_t[i], num_classes)
+                supervised_focal += focal_loss_frame(preds_t[i], Y_t[i])
+            annotated_frames += valid.sum().item()
 
-    if annotated_frames > 0:
-        supervised_loss = (supervised_ce/annotated_frames) \
-                         + lambda_dice*(supervised_dice/annotated_frames) \
-                         + lambda_focal*(supervised_focal/annotated_frames)
-    else:
-        supervised_loss = torch.tensor(0.0, device=preds.device)
+    supervised_loss = (supervised_ce + lambda_dice*supervised_dice + lambda_focal*supervised_focal) / max(annotated_frames, 1)
 
-    preds_soft = torch.softmax(preds, dim=1)
-    temporal_loss = sum(torch.mean((preds_soft[t+1] - preds_soft[t])**2) for t in range(T-1))
-    temporal_loss = temporal_loss/(T-1) if T>1 else torch.tensor(0.0, device=preds.device)
+    preds_soft = torch.softmax(preds, dim=2)  # softmax over classes
+    temporal_loss = torch.tensor(0.0, device=preds.device)
+    if T > 1:
+        temporal_loss = sum(((preds_soft[t+1] - preds_soft[t])**2).mean() for t in range(T-1)) / (T-1)
 
-    return supervised_loss + lambda_temp*temporal_loss
+    return supervised_loss + lambda_temp * temporal_loss
