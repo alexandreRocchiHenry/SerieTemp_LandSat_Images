@@ -1,11 +1,9 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-DataLoader semi-supervisé pour séries temporelles d’images satellites (4 bandes : RGB+NIR)
-avec recalage via un CSV de keyframes et conversion des masques multi‑canaux (8 bandes binaires)
-en masque d'indices de classes. La data augmentation est réalisée avec Albumentations,
-appliquée de façon identique à toute la séquence.
-Le split (train, val, test) est réalisé directement dans le code en se basant sur la colonne "key".
+Optimized data loader for daily satellite time series (RGB+NIR),
+including optional alignment shifts and multi-band label conversion.
+Includes semi-supervised aspects (mask_superv).
 """
 
 import os
@@ -18,299 +16,413 @@ from datetime import datetime
 from torch.utils.data import Dataset
 import torch.nn.functional as F
 from functools import lru_cache
-from tqdm import tqdm
 import albumentations as A
 
 ###############################################################################
-# Fonctions de lecture avec mise en cache
+# 1) Caching TIF file I/O
 ###############################################################################
-@lru_cache(maxsize=1024)
+@lru_cache(maxsize=4096)
 def read_tiff(path):
-    """Lit le fichier TIFF et renvoie le tableau numpy."""
+    """
+    Cached read of a TIFF file. 
+    Returns a NumPy array with shape (bands, height, width).
+    """
     with rasterio.open(path) as src:
         return src.read()
 
 ###############################################################################
-# Data Augmentation avec Albumentations
+# 2) Safer random cropping
 ###############################################################################
-def albumentations_sequence_transform(list_img, list_mask=None):
+def safe_random_crop(
+    image, mask, crop_w, crop_h, min_annot_ratio=0.05, max_attempts=5, rng=None
+):
     """
-    Applique une transformation Albumentations identique à toutes les frames d'une séquence.
-    Les images sont au format [C, H, W]. On les convertit en HWC, on applique la transformation,
-    puis on retransforme en CHW.
+    Tries multiple random crops so that at least min_annot_ratio
+    fraction of the crop is annotated (mask != 255). If no attempt works,
+    returns the last attempted crop.
     """
-    transform = A.Compose([
-         A.HorizontalFlip(p=0.5),
-         A.VerticalFlip(p=0.5),
-         A.RandomRotate90(p=0.5),
-         A.RandomBrightnessContrast(p=0.5),
-         A.RandomCrop(width=512, height=512, p=1.0),
-    ], additional_targets={'mask':'mask'})
-    
-    seed = random.randint(0, int(1e6))
-    augmented_imgs = []
-    augmented_masks = [] if list_mask is not None else None
-    
-    for idx, img in enumerate(list_img):
-        img_hwc = np.transpose(img, (1, 2, 0))
-        mask = None
-        if list_mask is not None and list_mask[idx] is not None:
-            mask = list_mask[idx]
-        augmented = transform(image=img_hwc, mask=mask, seed=seed)
-        aug_img = np.transpose(augmented['image'], (2, 0, 1))
-        augmented_imgs.append(aug_img)
+    if rng is None:
+        rng = np.random  
+    H, W, _ = image.shape
+    last_crop_img, last_crop_mask = None, None
+    for _ in range(max_attempts):
+        # random x,y
+        x = rng.randint(0, max(1, W - crop_w + 1)) if (W > crop_w) else 0
+        y = rng.randint(0, max(1, H - crop_h + 1)) if (H > crop_h) else 0
+        crop_img = image[y : y + crop_h, x : x + crop_w, :]
+        crop_mask = mask[y : y + crop_h, x : x + crop_w]
+        ratio = np.mean(crop_mask != 255)
+        if ratio >= min_annot_ratio:
+            return crop_img, crop_mask
+        last_crop_img, last_crop_mask = crop_img, crop_mask
+    return last_crop_img, last_crop_mask
+
+###############################################################################
+# 3) Data augmentation pipelines with Albumentations
+###############################################################################
+def safe_sequence_transform(
+    list_img, list_mask=None, crop_w=512, crop_h=512, min_annot_ratio=0.05, rng=None
+):
+    """
+    Applies the same Albumentations transforms to each frame in the sequence,
+    then a "safe" random crop that ensures enough labeled pixels.
+    """
+    if rng is None:
+        rng = np.random  
+
+    aug = A.Compose(
+        [
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.5),
+            A.RandomRotate90(p=0.5),
+            A.RandomBrightnessContrast(p=0.5),
+        ],
+        additional_targets={"mask": "mask"},
+    )
+
+    out_imgs, out_masks = [], [] if list_mask is not None else None
+    for i in range(len(list_img)):
+        img_chw = list_img[i]
+        # shape: (C, H, W) -> Albumentations (H, W, C)
+        img_hwc = np.transpose(img_chw, (1, 2, 0))
+        m = list_mask[i] if list_mask is not None else None
+
+        # apply transform
+        augmented = aug(image=img_hwc, mask=m)
+        img_tf = augmented["image"]
+        mask_tf = augmented["mask"] if m is not None else None
+
+        # safe random crop on the mask
+        if mask_tf is not None:
+            img_c, mask_c = safe_random_crop(
+                img_tf,
+                mask_tf,
+                crop_w,
+                crop_h,
+                min_annot_ratio,
+                rng=rng,
+            )
+        else:
+            center_aug = A.CenterCrop(height=crop_h, width=crop_w, p=1.0)
+            _res = center_aug(image=img_tf)
+            img_c = _res["image"]
+            mask_c = None
+
+        # revert (H,W,C) -> (C,H,W)
+        out_imgs.append(np.transpose(img_c, (2, 0, 1)))
         if list_mask is not None:
-            augmented_masks.append(augmented['mask'])
-            
-    return augmented_imgs, augmented_masks
+            out_masks.append(mask_c)
 
-def validation_transform(list_img, list_mask=None):
-    """
-    Applique une transformation déterministe (ici un center crop à 512x512)
-    à toutes les frames d'une séquence pour la validation ou le test.
-    Les images sont supposées au format [C, H, W]. On les convertit en HWC de manière contiguë,
-    on applique la transformation, puis on retransforme en CHW.
-    """
-    transform = A.Compose([
-         A.CenterCrop(width=512, height=512, p=1.0),
-    ], additional_targets={'mask': 'mask'})
-    
-    augmented_imgs = []
-    augmented_masks = [] if list_mask is not None else None
+    return out_imgs, out_masks
 
-    for idx, img in enumerate(list_img):
-        # Convertir en HWC et forcer la contiguïté
-        img_hwc = np.ascontiguousarray(np.transpose(img, (1, 2, 0)))
-        mask = None
-        if list_mask is not None and list_mask[idx] is not None:
-            mask = np.ascontiguousarray(list_mask[idx])
-        augmented = transform(image=img_hwc, mask=mask)
-        aug_img = np.transpose(augmented['image'], (2, 0, 1))
-        augmented_imgs.append(aug_img)
+# transform for validation
+def validation_transform(list_img, list_mask=None, size=512):
+    """
+    Center-crop transform for validation. No randomness, same shape on all frames.
+    """
+    center_aug = A.Compose(
+        [A.CenterCrop(height=size, width=size, p=1.0)],
+        additional_targets={"mask": "mask"},
+    )
+    out_imgs, out_masks = [], [] if list_mask is not None else None
+
+    for i in range(len(list_img)):
+        img_chw = list_img[i]
+        img_hwc = np.transpose(img_chw, (1, 2, 0))
+        m = list_mask[i] if list_mask is not None else None
+
+        if m is not None:
+            m = np.ascontiguousarray(m)
+        res = center_aug(image=img_hwc, mask=m)
+        img_c = np.transpose(res["image"], (2, 0, 1))
+        out_imgs.append(img_c)
         if list_mask is not None:
-            augmented_masks.append(augmented['mask'])
-            
-    return augmented_imgs, augmented_masks
+            out_masks.append(res["mask"])
 
+    return out_imgs, out_masks
 
-default_augmentation_fn = albumentations_sequence_transform
 validation_fn = validation_transform
+default_augmentation_fn = safe_sequence_transform
 
 ###############################################################################
-# Fonction pour appliquer le recalage sur une image multi-canaux (CPU uniquement)
+# 4) Shifting images/masks in CPU with grid_sample
 ###############################################################################
-def apply_shift_multi_channel(arr_img, shift_params):
+import torch.nn.functional as F
+
+def apply_shift_multi_channel(arr_img, shift_xy):
+    """
+    arr_img shape: (C, H, W). shift_xy is (shiftX, shiftY) in pixels.
+    We treat shift as a pure translation, using bilinear grid_sample.
+    """
+    if shift_xy is None:
+        return arr_img 
     device = "cpu"
-    t_img = torch.tensor(arr_img, dtype=torch.float32, device=device).unsqueeze(0) / 255.0
-    B, C, H, W = t_img.shape
+    C, H, W = arr_img.shape
+    # to [1,C,H,W]
+    t = torch.tensor(arr_img, dtype=torch.float32, device=device).unsqueeze(0) / 255.0
+
+    # build sampling grid
+    shift_x, shift_y = shift_xy
     grid_y, grid_x = torch.meshgrid(
         torch.arange(H, dtype=torch.float32, device=device),
         torch.arange(W, dtype=torch.float32, device=device),
-        indexing='ij'
+        indexing="ij",
     )
-    shift_x_norm = 2.0 * shift_params[0] / max(W - 1, 1.0)
-    shift_y_norm = 2.0 * shift_params[1] / max(H - 1, 1.0)
+
+    shift_x_norm = 2.0 * shift_x / max(W - 1, 1)
+    shift_y_norm = 2.0 * shift_y / max(H - 1, 1)
+
+    grid_x_norm = (2.0 * grid_x / (W - 1)) - 1.0 - shift_x_norm
+    grid_y_norm = (2.0 * grid_y / (H - 1)) - 1.0 - shift_y_norm
+
+    sampling_grid = torch.stack((grid_x_norm, grid_y_norm), dim=-1).unsqueeze(0)
+    warped = F.grid_sample(
+        t, sampling_grid, mode="bilinear", padding_mode="zeros", align_corners=True
+    )
+    out = (warped.squeeze(0) * 255.0).cpu().numpy()
+    return out
+
+def apply_shift_mask(mask, shift_xy):
+    """
+    mask shape: (H,W). shift_xy is (shiftX, shiftY). nearest-neighbor sampling.
+    """
+    if shift_xy is None:
+        return mask
+    device = "cpu"
+    H, W = mask.shape
+    # shape: [1,1,H,W]
+    t = torch.tensor(mask, dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0)
+
+    shift_x, shift_y = shift_xy
+    shift_x_norm = 2.0 * shift_x / max(W - 1, 1)
+    shift_y_norm = 2.0 * shift_y / max(H - 1, 1)
+
+    grid_y, grid_x = torch.meshgrid(
+        torch.arange(H, dtype=torch.float32, device=device),
+        torch.arange(W, dtype=torch.float32, device=device),
+        indexing='ij',
+    )
     grid_x_norm = (2.0 * grid_x / (W - 1)) - 1.0 - shift_x_norm
     grid_y_norm = (2.0 * grid_y / (H - 1)) - 1.0 - shift_y_norm
     grid = torch.stack((grid_x_norm, grid_y_norm), dim=-1).unsqueeze(0)
-    warped = F.grid_sample(t_img, grid, mode='bilinear', padding_mode='zeros', align_corners=True)
-    warped_np = (warped.squeeze(0) * 255.0).detach().cpu().numpy()
-    return warped_np
+
+    warped = F.grid_sample(t, grid, mode="nearest", padding_mode="zeros", align_corners=True)
+    out = warped.squeeze().cpu().numpy().astype(np.uint8)
+    return out
 
 ###############################################################################
-# CLASSE TemporalSatDataset
+# 5) The main Dataset
 ###############################################################################
 class TemporalSatDataset(Dataset):
     """
-    Dataset pour séries temporelles d’images satellites avec recalage.
-    
-    Les images proviennent de 4 bandes (RGB+NIR) et les masques sont des TIFF à 8 bandes
-    (chaque bande vaut 0 ou 255). La conversion se fait pour obtenir un masque à une
-    seule classe par pixel, avec 255 indiquant l'absence d'annotation.
-    
-    Le split (train, val, test) est réalisé dans le code en se basant sur la colonne "key".
+    Dataset for time-series satellite images (4 bands) plus multi-channel (8-band)
+    label TIFF that we convert to a single-class-per-pixel segmentation mask (0..7, with 255=ignore).
+    The 'split' argument is just used to filter subsets by key in a simple random manner.
     """
-    def __init__(self,
-                 csv_path,
-                 alignment_csv,
-                 transform_fn=default_augmentation_fn,
-                 seq_length=None,
-                 random_subseq=True,
-                 split='train',           # 'train', 'val' ou 'test'
-                 train_ratio=0.7,
-                 val_ratio=0.15,
-                 test_ratio=0.15,
-                 split_seed=42):
-        super().__init__()
-        self.df = pd.read_csv(csv_path)
-        # Conserver uniquement les lignes dont le chemin existe
-        self.df = self.df[self.df['planet_path'].apply(os.path.exists)].reset_index(drop=True)
-        for col in ["key", "date", "planet_path"]:
-            if col not in self.df.columns:
-                raise ValueError(f"Le CSV doit contenir la colonne '{col}'.")
-        if "labels_path" not in self.df.columns:
-            self.df["labels_path"] = None
 
-        # Split sur la base de la clé sans modifier le CSV
-        unique_keys = self.df["key"].unique()
+    def __init__(
+        self,
+        csv_path,
+        alignment_csv,
+        transform_fn=None,
+        seq_length=None,
+        random_subseq=True,
+        split="train",  # 'train','val','test'
+        train_ratio=0.7,
+        val_ratio=0.15,
+        test_ratio=0.15,
+        split_seed=42,
+    ):
+        super().__init__()
+        self.transform_fn = transform_fn
+        self.seq_length = seq_length
+        self.random_subseq = random_subseq
+
+        
+        df = pd.read_csv(csv_path)
+        # Filter 
+        df = df[df["planet_path"].apply(os.path.exists)].reset_index(drop=True)
+        if "labels_path" not in df.columns:
+            df["labels_path"] = None
+
+        # Basic checks
+        for col in ("key", "date", "planet_path"):
+            if col not in df.columns:
+                raise ValueError(f"Missing required column '{col}' in CSV")
+
+        # Shuffle
+        unique_keys = df["key"].unique()
         rng = np.random.default_rng(split_seed)
         rng.shuffle(unique_keys)
         n = len(unique_keys)
         n_train = int(train_ratio * n)
         n_val = int(val_ratio * n)
-        if split == 'train':
-            selected_keys = unique_keys[:n_train]
-        elif split == 'val':
-            selected_keys = unique_keys[n_train:n_train+n_val]
-        elif split == 'test':
-            selected_keys = unique_keys[n_train+n_val:]
+
+        if split == "train":
+            chosen_keys = unique_keys[:n_train]
+        elif split == "val":
+            chosen_keys = unique_keys[n_train : n_train + n_val]
+        elif split == "test":
+            chosen_keys = unique_keys[n_train + n_val :]
         else:
-            raise ValueError("split doit être 'train', 'val' ou 'test'.")
+            raise ValueError("split must be 'train','val' or 'test'")
 
-        self.df = self.df[self.df["key"].isin(selected_keys)].reset_index(drop=True)
-        
-        # Conversion de la date
-        self.df["date_dt"] = pd.to_datetime(self.df["date"], format="%Y-%m-%d")
-        
-        # Groupement par "key" et tri chronologique
-        self.grouped_key = []
-        for key_val, group in self.df.groupby("key"):
-            group_sorted = group.sort_values("date_dt")
-            seq = []
-            for idx, row in group_sorted.iterrows():
-                seq.append({
-                    "planet_path": row["planet_path"],
-                    "labels_path": row["labels_path"] if pd.notna(row["labels_path"]) else None,
-                    "date": row["date_dt"]
-                })
-            self.grouped_key.append({
-                "key": key_val,
-                "sequence": seq
-            })
-        
-        self.transform_fn = transform_fn
-        self.seq_length = seq_length
-        self.random_subseq = random_subseq
-        
-        # Chargement du CSV d'alignement
+        df = df[df["key"].isin(chosen_keys)].copy()
+
+        df["date_dt"] = pd.to_datetime(df["date"], format="%Y-%m-%d")
+
+ 
+        self.samples_by_key = []
+        for key_val, g in df.groupby("key"):
+            g = g.sort_values("date_dt")
+            seq_list = []
+            for _, row in g.iterrows():
+                seq_list.append(
+                    {
+                        "planet_path": row["planet_path"],
+                        "labels_path": row["labels_path"] if pd.notna(row["labels_path"]) else None,
+                        "date": row["date_dt"],
+                    }
+                )
+            self.samples_by_key.append({"key": key_val, "sequence": seq_list})
+
+        #  alignment CSV 
         self.alignment_dict = {}
-        df_align = pd.read_csv(alignment_csv)
-        for idx, row in df_align.iterrows():
-            align_key = (row["zone_path"], row["image_name"])
-            self.alignment_dict[align_key] = (row["shift_x"], row["shift_y"])
-    
-    def __len__(self):
-        return len(self.grouped_key)
-    
-    def select_subsequence(self, seq):
-        T_all = len(seq)
-        if self.seq_length is None or self.seq_length >= T_all:
-            if not any(info["labels_path"] is not None and os.path.exists(info["labels_path"]) for info in seq):
-                raise ValueError("La séquence ne contient aucune annotation.")
-            return seq
+        align_df = pd.read_csv(alignment_csv)
+        for _, rw in align_df.iterrows():
+            zpath = rw["zone_path"]
+            fname = rw["image_name"]
+            shiftxy = (rw["shift_x"], rw["shift_y"])
+            self.alignment_dict[(zpath, fname)] = shiftxy
 
-        annotated_indices = [i for i, info in enumerate(seq)
-                             if info["labels_path"] is not None and os.path.exists(info["labels_path"])]
-        if not annotated_indices:
-            raise ValueError("La séquence ne contient aucune annotation.")
-        chosen_idx = random.choice(annotated_indices)
-        start_min = max(0, chosen_idx - self.seq_length + 1)
-        start_max = min(chosen_idx, T_all - self.seq_length)
-        start = start_min if start_max < start_min else random.randint(start_min, start_max)
-        return seq[start:start+self.seq_length]
-    
-    def __getitem__(self, index):
-  
-        item = self.grouped_key[index]
-        key_val = item["key"]
-        
-        seq_meta = item["sequence"]
-        
-        # Au début de __getitem__, juste après avoir récupéré seq_meta et annotated
+    def __len__(self):
+        return len(self.samples_by_key)
+
+    def _pick_subsequence(self, sequence):
+        """
+        Given the full sorted sequence for one key, either take the entire thing
+        or choose a sub-range of length self.seq_length that ensures at least 1 annotated frame.
+        """
+        T_all = len(sequence)
+        if self.seq_length is None or self.seq_length >= T_all:
+         
+            if not any(s["labels_path"] is not None and os.path.exists(s["labels_path"]) for s in sequence):
+                raise ValueError("No annotated frames in entire sequence.")
+            return sequence
+
+        # find indices that have annotation
+        ann_idx = [
+            i for i, s in enumerate(sequence)
+            if s["labels_path"] is not None and os.path.exists(s["labels_path"])
+        ]
+        if not ann_idx:
+            raise ValueError("No annotated frames found in that sequence.")
+
+
+        chosen_i = random.choice(ann_idx)
+        start_min = max(0, chosen_i - self.seq_length + 1)
+        start_max = min(chosen_i, T_all - self.seq_length)
+        if start_min > start_max:
+            start_idx = 0
+        else:
+            start_idx = random.randint(start_min, start_max)
+        return sequence[start_idx : start_idx + self.seq_length]
+
+    def __getitem__(self, idx):
+        item = self.samples_by_key[idx]
+        seq_list = item["sequence"]
+        # choose frames
         if self.seq_length is not None:
             if self.random_subseq:
-                chosen_meta = self.select_subsequence(seq_meta)
+                chosen_seq = self._pick_subsequence(seq_list)
             else:
-                start = (len(seq_meta) - self.seq_length) // 2
-                chosen_meta = seq_meta[start : start + self.seq_length]
+                n = len(seq_list)
+                start_i = max(0, (n - self.seq_length) // 2)
+                chosen_seq = seq_list[start_i : start_i + self.seq_length]
         else:
-            chosen_meta = seq_meta
+            chosen_seq = seq_list
 
-            if not any(info["labels_path"] is not None and os.path.exists(info["labels_path"]) for info in chosen_meta):
-                raise ValueError(f"[DEBUG __getitem__] La séquence pour key {key_val} ne contient aucune annotation.")
-        
-        
-        T = len(chosen_meta)
-        list_img = []
-        list_mask = []
-        for idx, info in enumerate(chosen_meta):
+        T = len(chosen_seq)
+        # read images & masks
+        images = []
+        masks = []
+        for info in chosen_seq:
+            planet_p = info["planet_path"]
             
-            planet_path = info["planet_path"]
-            labels_path = info["labels_path"]
+            arr = read_tiff(planet_p).astype(np.float32)  # shape (bands,H,W)
+            base_name = os.path.basename(planet_p)
+            zone_path = os.path.dirname(planet_p)
 
-            arr = read_tiff(planet_path).astype(np.float32)
-            base_name = os.path.basename(planet_path)
-            zone_path = os.path.dirname(planet_path)
-            align_key = (zone_path, base_name)
-            if align_key in self.alignment_dict:
-                shift_params = self.alignment_dict[align_key]
-                
-                arr = apply_shift_multi_channel(arr, shift_params)
-            list_img.append(arr)
+            shift = self.alignment_dict.get((zone_path, base_name), None)
+            # apply shift if present
+            if shift is not None:
+                # needs shape (C,H,W)
+                arr = apply_shift_multi_channel(arr, shift)
+
+            images.append(arr)
+
+  
+            labels_p = info["labels_path"]
+            if labels_p is not None and os.path.exists(labels_p):
+                lab_8b = read_tiff(labels_p)  # shape (8,H,W)
+                # convert to single-class
+                # each band is 0 or 255
+                bin_mask = (lab_8b >= 1)  # True/False
+                count_per_px = bin_mask.sum(axis=0)
+                # compute weight
+                global_counts = bin_mask.sum(axis=(1, 2)).astype(np.float32) + 1e-6
+                weights = bin_mask.astype(np.float32) / global_counts[:, None, None]
+                class_map = np.argmax(weights, axis=0)  # shape(H,W)
             
-            if labels_path is not None and os.path.exists(labels_path):
+                class_map[count_per_px == 0] = 255
 
-                try:
-                    label_8bands = read_tiff(labels_path)
-                except Exception as e:
-                   
-                    mask_data = None
-                else:
-
-                    # Création du masque d'indice unique à partir des 8 bandes
-                    bin_mask = (label_8bands == 255)
-                    count_per_pixel = bin_mask.sum(axis=0)
-                    global_counts = bin_mask.sum(axis=(1,2)).astype(np.float32) + 1e-6
-                    weights = bin_mask.astype(np.float32) / global_counts[:, None, None]
-                    class_indices = np.argmax(weights, axis=0)
-                    no_class = (count_per_pixel == 0)
-                    class_indices[no_class] = 255
-                    mask_data = class_indices.astype(np.uint8)
+                if shift is not None:
+                    class_map = apply_shift_mask(class_map, shift)
+                masks.append(class_map)
             else:
-               
-                mask_data = None
-            list_mask.append(mask_data)
+                
+                masks.append(None)
+
         
         if self.transform_fn is not None:
+            images_out, masks_out = self.transform_fn(images, masks)
+        else:
+            images_out, masks_out = images, masks
 
-            list_img, list_mask = self.transform_fn(list_img, list_mask)
-          
-        
-        X_list = []
-        Y_list = []
+    
+        # shape => [T,4,H,W] float32, and Y => [T,H,W] long
+        X_list, Y_list = [], []
         for i in range(T):
-
-            x_t = torch.from_numpy(list_img[i])
+  
+            x_t = torch.from_numpy(images_out[i])
             X_list.append(x_t)
-            if list_mask[i] is not None:
-                y_t = torch.from_numpy(list_mask[i])
-                Y_list.append(y_t)
+            if masks_out[i] is not None:
+                y_t = torch.from_numpy(masks_out[i])
             else:
-                Y_list.append(None)
-        X = torch.stack(X_list, dim=0)  # [T, 4, H, W]
-        T, _, H, W = X.shape
+                y_t = None
+            Y_list.append(y_t)
 
-        # Initialiser Y avec 255 (ignore_index) pour les pixels non annotés
-        Y = torch.full((T, H, W), fill_value=255, dtype=torch.long)
+        X = torch.stack(X_list, dim=0)  # shape [T, 4, H, W]
+
+
+        T, _, H, W = X.shape
+        Y = torch.full((T, H, W), 255, dtype=torch.long)
         mask_superv = torch.zeros((T,), dtype=torch.bool)
         for t in range(T):
             if Y_list[t] is not None:
                 Y[t] = Y_list[t]
                 mask_superv[t] = True
 
-        sample = {"X": X, "Y": Y, "mask_superv": mask_superv, "key": key_val}
-        mean = torch.tensor([1042.59, 915.62, 671.26, 2605.21], dtype=torch.float32, device=X.device)
-        std  = torch.tensor([957.96, 715.55, 596.94, 1059.90], dtype=torch.float32, device=X.device)
-        X = (X - mean.view(1, -1, 1, 1)) / std.view(1, -1, 1, 1)
-        sample["X"] = X
-        return sample
+       
+        device_cpu = torch.device("cpu")
+        means = torch.tensor([1042.59, 915.62, 671.26, 2605.21], device=device_cpu, dtype=torch.float32)
+        stds  = torch.tensor([957.96, 715.55, 596.94, 1059.90], device=device_cpu, dtype=torch.float32)
+        # (T,4,H,W)
+        X = (X - means.view(1, -1, 1, 1)) / stds.view(1, -1, 1, 1)
+
+        return {
+            "X": X,                  # [T,4,H,W], float
+            "Y": Y,                  # [T,H,W], long
+            "mask_superv": mask_superv,  # [T], bool
+            "key": item["key"],      # str
+        }

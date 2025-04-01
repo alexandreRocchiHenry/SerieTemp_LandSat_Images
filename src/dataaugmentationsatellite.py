@@ -9,7 +9,6 @@ class SatelliteAugmentation:
         """
         self.prob = prob
 
-        # Define transformations that preserve the original size (1024x1024)
         self.rgb_transforms = T.Compose([
             T.RandomHorizontalFlip(p=prob),
             T.RandomVerticalFlip(p=prob),
@@ -22,13 +21,9 @@ class SatelliteAugmentation:
         Apply augmentations to both the image and label while preserving the IR band.
         """
         if random.random() < self.prob:
-            # Split channels: RGB (first 3) and IR (last channel)
+          
             rgb, ir = image[:3], image[3:]
-
-            # Apply transformations to RGB channels only
             rgb = self.rgb_transforms(rgb)
-
-            # Concatenate IR back to the transformed RGB
             image = torch.cat([rgb, ir], dim=0)
 
         return image, label

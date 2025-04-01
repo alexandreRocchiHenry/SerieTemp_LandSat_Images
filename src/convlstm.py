@@ -92,7 +92,6 @@ class ConvLSTM(nn.Module):
 
         self._check_kernel_size_consistency(kernel_size)
 
-        # Make sure that both `kernel_size` and `hidden_dim` are lists having len == num_layers
         kernel_size = self._extend_for_multilayer(kernel_size, num_layers)
         hidden_dim = self._extend_for_multilayer(hidden_dim, num_layers)
         if not len(kernel_size) == len(hidden_dim) == num_layers:
@@ -136,12 +135,10 @@ class ConvLSTM(nn.Module):
             input_tensor = input_tensor.permute(1, 0, 2, 3, 4)
 
         b, _, _, h, w = input_tensor.size()
-
-        # Implement stateful ConvLSTM
+        
         if hidden_state is not None:
             raise NotImplementedError()
         else:
-            # Since the init is done in forward. Can send image size here
             hidden_state = self._init_hidden(batch_size=b,
                                              image_size=(h, w))
 

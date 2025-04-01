@@ -116,7 +116,6 @@ class ImageAlignementCheck:
         good_matches = []
         for match in matches:
             if len(match) < 2:
-                # skip this match if it doesn't have 2 neighbors
                 continue
             m, n = match
             if m.distance < ratio * n.distance:
@@ -177,22 +176,13 @@ class ImageAlignementCheck:
                 [keypoints2[m.trainIdx].pt for m in good_matches]
             ).reshape(-1, 1, 2)
     
-            # calculate Homography, with RANSAC algorithm, using 5.0 as 
-            # threshold. The homography is calculated from the source points
-            # to the destination points. The threshold is the maximum
-            # distance to consider a point as an inlier, to include it in the
-            # homography calculation.
             H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
-    
-            # check if the homography is close to the identity matrix
+
             if np.allclose(H, np.eye(3), atol=atol):
-                #print("Les images sont correctement alignées.")
                 return True, H
             else:
-                #print("Les images ne sont pas alignées.")
                 return False, H
         else:
-            #print("Pas assez de correspondances pour vérifier l'alignement.")
             return None
         
     def image_alignement_visualisation(self, image1, image2, ratio=0.75):
@@ -357,10 +347,9 @@ def main():
     folders_file = './folders.txt'
     with open(folders_file, 'r') as file:
         folders_list =[line.strip() for line in file.readlines()]
-        
-    # folders_list_subset = folders_list[:2]
 
-    for folder_path in folders_list: # or folders_list_subset
+
+    for folder_path in folders_list:
         results, mean_shifts, max_shifts = image_alignement_check.analyze_images_in_directory(
             folder_path, ratio=0.65
         )
@@ -368,19 +357,16 @@ def main():
         mean_shifts_all.append(mean_shifts)
         max_shifts_all.append(max_shifts)
 
-    # Save alignment results
     df = pd.DataFrame(results_all).transpose()
 
-    df.columns = folders_list # or folders_list_subset
+    df.columns = folders_list 
 
     df.to_csv('results_alignement.csv', index=False)
 
-    # Save mean shift values
     df_mean_shifts = pd.DataFrame(mean_shifts_all).transpose()
     df_mean_shifts.columns = folders_list
     df_mean_shifts.to_csv('mean_shifts.csv', index=False)
 
-    # Save max shift values
     df_max_shifts = pd.DataFrame(max_shifts_all).transpose()
     df_max_shifts.columns = folders_list
     df_max_shifts.to_csv('max_shifts.csv', index=False)
