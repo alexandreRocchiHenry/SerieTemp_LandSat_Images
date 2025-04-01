@@ -268,7 +268,6 @@ import rasterio
 from rasterio.warp import calculate_default_transform, reproject, Resampling
 import geotorch
 
-# --- Your SimpleFeatureNet definition remains unchanged ---
 import os
 import numpy as np
 import torch
@@ -326,8 +325,6 @@ class GeoKeyFrameAlignGPUParallel:
 
         self.feature_extractor = SimpleFeatureNet()
         self.feature_extractor.to(self.devices[0] if self.device_count > 0 else "cpu")
-        # Si GeoTorch >= 0.3.0, on peut activer la contrainte orthogonale :
-        # geotorch.orthogonal(self.feature_extractor.conv1, "weight")
 
     def load_and_reproject(self, image_path):
         """
