@@ -19,13 +19,12 @@ from metrics import MetricsEvaluator
 
 def evaluate(model, loader, evaluator, device):
     model.eval()
-    # Utilisation de torch.amp pour accélérer l'évaluation
     with torch.no_grad(), autocast(device_type='cuda'):
         for batch in tqdm(loader, desc="Evaluation", unit="batch"):
             X = batch["X"].to(device)
             Y = batch["Y"].to(device)
             preds = model(X)
-            # On vérifie que les dimensions sont conformes (selon l'ordre des axes)
+            
             if preds.shape[0] != batch["mask_superv"].shape[1]:
                 preds = preds.permute(1, 0, 2, 3, 4)
             T, B, C, H, W = preds.shape
@@ -48,16 +47,16 @@ def display_metrics(metrics, epoch, fold):
 
 def train_fold(train_csv, val_csv, fold, device, local_rank, num_epochs, batch_size, num_workers, num_classes, lr):
     
-    # Pour 7 classes issues du papier, et si vous avez num_classes=8, on ajoute une valeur par défaut pour la 8ᵉ classe.
+    
     class_weights = torch.tensor([1.13, 0.78, 0.18, 11.43, 0.29, 1.0, 8.0], dtype=torch.float32)
     
-    # Création des datasets à partir des CSV spécifiques au pli
+
     train_dataset = TemporalSatDataset(train_csv, ALIGNMENT_CSV, default_augmentation_fn,
                                          seq_length=SEQ_LENGTH, random_subseq=True, split='train')
     val_dataset = TemporalSatDataset(val_csv, ALIGNMENT_CSV, validation_fn,
                                        seq_length=SEQ_LENGTH * 4, random_subseq=False, split='val')
     
-    # Création des DistributedSamplers pour répartir les données entre les processus
+   
     train_sampler = DistributedSampler(train_dataset, shuffle=True)
     val_sampler = DistributedSampler(val_dataset, shuffle=False)
     
@@ -66,7 +65,7 @@ def train_fold(train_csv, val_csv, fold, device, local_rank, num_epochs, batch_s
     val_loader = DataLoader(val_dataset, batch_size=batch_size, sampler=val_sampler,
                             num_workers=num_workers, pin_memory=True)
     
-    # Initialisation du modèle, en gardant la configuration de gel des paramètres
+    
     model = TemporalPlanetDeepLab(num_classes=num_classes).to(device)
     for p in model.encoder.parameters():
         p.requires_grad = False
@@ -74,13 +73,11 @@ def train_fold(train_csv, val_csv, fold, device, local_rank, num_epochs, batch_s
         p.requires_grad = False
     for p in model.classifier.parameters():
         p.requires_grad = True
-    
-    # Encapsulation dans DDP
+
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
     optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=lr)
     scaler = GradScaler()
     
-    # Définition des étapes pour débloquer certains modules
     unfreeze = {"convlstm": 5, "encoder": 10}
     best_val_loss = float('inf')
     
@@ -126,7 +123,6 @@ def train_fold(train_csv, val_csv, fold, device, local_rank, num_epochs, batch_s
             val_metrics = evaluate(model.module, val_loader, evaluator, device)
             display_metrics(val_metrics, epoch, fold)
             
-            # Sauvegarde du meilleur modèle du pli
             if avg_loss < best_val_loss:
                 best_val_loss = avg_loss
                 torch.save(model.state_dict(), f"best_model_fold_{fold}.pth")
@@ -134,7 +130,7 @@ def train_fold(train_csv, val_csv, fold, device, local_rank, num_epochs, batch_s
     return best_val_loss
 
 def main():
-    # Initialisation du groupe de processus distribué (DDP)
+    
     dist.init_process_group(backend="nccl")
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
@@ -152,16 +148,13 @@ def main():
     lr = 1e-4
     n_splits = 5
     
-
-    
-    # Chargement du CSV complet
     df_full = pd.read_csv(CSV_PATH)
     groups = df_full["key"]
     gkf = GroupKFold(n_splits=n_splits)
     
     os.makedirs("dataframe", exist_ok=True)
     
-    # Création des fichiers CSV pour chaque pli uniquement par le processus de rang 0
+    
     if local_rank == 0:
         for fold, (train_idx, val_idx) in enumerate(gkf.split(df_full, groups=groups)):
             train_df = df_full.iloc[train_idx]
@@ -170,12 +163,12 @@ def main():
             val_csv = f"dataframe/val_fold_{fold}.csv"
             train_df.to_csv(train_csv, index=False)
             val_df.to_csv(val_csv, index=False)
-    # Synchronisation de tous les processus pour s'assurer que les CSV sont créés
+   
     dist.barrier()
     
     best_models = []
     fold = 0
-    # Chaque processus lit les CSV existants pour chaque pli
+
     for _, _ in gkf.split(df_full, groups=groups):
         train_csv = f"dataframe/train_fold_{fold}.csv"
         val_csv = f"dataframe/val_fold_{fold}.csv"

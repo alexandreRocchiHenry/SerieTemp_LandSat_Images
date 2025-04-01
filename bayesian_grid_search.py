@@ -177,7 +177,7 @@ def train_single_config(train_dataset, val_dataset, device_params, combo):
         start_epoch=10,
         monitor="val_mIoU",
         mode="max",
-        patience=5,
+        patience=11,
         verbose=True
     )
     
