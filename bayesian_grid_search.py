@@ -173,21 +173,21 @@ def train_single_config(train_dataset, val_dataset, device_params, combo):
         unfreeze_convlstm_epoch=device_params["unfreeze_convlstm_epoch"],
         unfreeze_encoder_epoch=device_params["unfreeze_encoder_epoch"]
     )
-    early_stop_callback = DelayedEarlyStopping(
-        start_epoch=10,
-        monitor="val_mIoU",
-        mode="max",
-        patience=11,
-        verbose=True
-    )
+    # early_stop_callback = DelayedEarlyStopping(
+    #     start_epoch=10,
+    #     monitor="val_mIoU",
+    #     mode="max",
+    #     patience=11,
+    #     verbose=True
+    # )
     
     trainer = Trainer(
         max_epochs=device_params["num_epochs"],
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=-1 if torch.cuda.is_available() else None,
         strategy=DDPStrategy(find_unused_parameters=True),
-        accumulate_grad_batches=12,
-        callbacks=[callback_freeze, early_stop_callback],
+        accumulate_grad_batches=5,
+        callbacks=[callback_freeze],
         log_every_n_steps=10,
         precision=16,
     )
@@ -210,7 +210,7 @@ def train_single_config(train_dataset, val_dataset, device_params, combo):
     return model, best_val_miou
 
 def objective(trial, train_dataset, val_dataset, device_params):
-    lr             = trial.suggest_float("lr", 1e-5, 5e-4, log=True)
+    lr             = trial.suggest_float("lr", 1e-5, 1e-3, log=True)
     lambda_temp    = trial.suggest_float("lambda_temp", 0.01, 0.2, step=0.01)
     lambda_tversky = trial.suggest_float("lambda_tversky", 0.6, 1.4, step=0.1)
     lambda_lovasz  = trial.suggest_float("lambda_lovasz", 0.6, 1.4, step=0.1)
@@ -263,11 +263,13 @@ def main():
     study = optuna.create_study(direction="maximize")
     study.optimize(lambda trial: objective(trial, train_dataset, val_dataset, device_params), n_trials=10)
     
+    df_study.to_csv("bayesian_search_results.csv", index=False)
     print("\n===== BAYESIAN SEARCH FINISHED =====")
     print("Best trial:")
     best_trial = study.best_trial
     print("Value (val_mIoU):", best_trial.value)
     print("Params:", best_trial.params)
+    
 
 if __name__ == "__main__":
     main()
