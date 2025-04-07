@@ -20,7 +20,7 @@ from pytorch_lightning.strategies import DDPStrategy
 import optuna
 
 from dataloader_sat_image import TemporalSatDataset, default_augmentation_fn, validation_fn
-from loss_sat_images import temporal_semi_supervised_loss
+from loss_sat_images import temporal_semi_supervised_loss, temporal_semi_supervised_dice_loss
 from model_deeplabv3_plus import TemporalPlanetDeepLab
 from metrics import MetricsEvaluator
 

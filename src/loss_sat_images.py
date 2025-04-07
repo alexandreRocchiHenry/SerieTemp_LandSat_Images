@@ -139,3 +139,173 @@ def temporal_semi_supervised_loss(preds: torch.Tensor, sample: dict,
     temp_loss = temporal_consistency_loss(preds_soft)
     
     return sup_loss + lambda_temp * temp_loss
+
+##############################
+
+class WeightedCrossEntropyLoss(nn.Module):
+    def __init__(self, ignore_index=255, class_weights=None):
+        super().__init__()
+        self.ignore_index = ignore_index
+        self.class_weights = class_weights
+
+    def forward(self, logits, targets):
+        """
+        logits: [B, C, H, W] (sorties du modèle, non-normalisées)
+        targets: [B, H, W] (label avec index de classe)
+        """
+        if self.ignore_index is not None:
+            mask = (targets != self.ignore_index)
+            if mask.sum() == 0:
+                return torch.tensor(0., device=logits.device)
+        else:
+            mask = torch.ones_like(targets, dtype=torch.bool)
+
+       
+        if self.class_weights is not None:
+            class_weights = self.class_weights.to(logits.device)
+        else:
+            class_weights = None
+
+        loss = F.cross_entropy(logits, targets,
+                               weight=class_weights,
+                               ignore_index=self.ignore_index,
+                               reduction='mean')
+        return loss
+
+
+class WeightedDiceLoss(nn.Module):
+    def __init__(self, num_classes, ignore_index=255, class_weights=None, smooth=1e-5):
+        super().__init__()
+        self.num_classes = num_classes
+        self.ignore_index = ignore_index
+        self.class_weights = class_weights
+        self.smooth = smooth
+
+    def forward(self, logits, targets):
+        """
+        logits: [B, C, H, W] (sorties du modèle)
+        targets: [B, H, W] (label avec index de classe)
+        """
+        probs = F.softmax(logits, dim=1)
+
+        mask = (targets != self.ignore_index)
+        if mask.sum() == 0:
+            return torch.tensor(0., device=logits.device)
+        
+        targets_clamped = targets.clone()
+        targets_clamped[~mask] = 0
+        
+        one_hot = F.one_hot(targets_clamped, self.num_classes).permute(0, 3, 1, 2).float()
+        # On applique le masque
+        one_hot = one_hot * mask.unsqueeze(1)
+        probs = probs * mask.unsqueeze(1)
+
+        # Calcule Dice par classe
+        dims = (0, 2, 3)
+        intersection = (probs * one_hot).sum(dims)
+        union = probs.sum(dims) + one_hot.sum(dims)
+
+        dice_score = (2.0 * intersection + self.smooth) / (union + self.smooth)
+        dice_loss = 1 - dice_score  # on prend (1 - Dice)
+
+        # Applique les poids de classe
+        if self.class_weights is not None:
+            w = self.class_weights.to(logits.device)[:self.num_classes]
+            dice_loss = dice_loss * w
+        
+        return dice_loss.mean()
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class WeightedFocalLoss(nn.Module):
+    def __init__(self, ignore_index=255, class_weights=None, gamma=2.0):
+        super().__init__()
+        self.ignore_index = ignore_index
+        self.class_weights = class_weights
+        self.gamma = gamma
+
+    def forward(self, logits, targets):
+        """
+        logits: [B, C, H, W]
+        targets: [B, H, W]
+        """
+        mask = (targets != self.ignore_index) if self.ignore_index is not None else None
+        if mask is not None and mask.sum() == 0:
+            return torch.tensor(0., device=logits.device)
+
+        probs = F.softmax(logits, dim=1)
+
+        pt = probs.gather(1, targets.unsqueeze(1))  # [B, 1, H, W]
+        pt = pt.squeeze(1)                          # [B, H, W]
+
+
+        if self.class_weights is not None:
+            w = self.class_weights.to(logits.device)
+            class_w = w[targets]  # [B, H, W]
+        else:
+            class_w = 1.0
+
+        if mask is not None:
+            pt = pt[mask]
+            class_w = class_w[mask]
+
+        focal_loss = - class_w * (1 - pt).pow(self.gamma) * pt.log()
+
+        return focal_loss.mean()
+
+
+import torch
+import torch.nn.functional as F
+
+def temporal_semi_supervised_dice_loss(
+    preds: torch.Tensor,
+    sample: dict,
+    dice_criterion,
+    lambda_temp: float = 1.0
+) -> torch.Tensor:
+    """
+    preds: [T, B, C, H, W] (sortie du réseau)
+    sample: dictionnaire {"Y": [B, T, H, W], "mask_superv": [B, T]}
+    dice_criterion: instance de WeightedDiceLoss
+    lambda_temp: coefficient pour la consistance temporelle
+    """
+    if preds.shape[0] != sample["mask_superv"].shape[1]:
+        preds = preds.permute(1, 0, 2, 3, 4)
+
+    T, B, C, H, W = preds.shape
+    Y = sample["Y"].permute(1, 0, 2, 3)             # [T, B, H, W]
+    mask = sample["mask_superv"].permute(1, 0).bool()  # [T, B]
+
+    sup_loss = torch.tensor(0., device=preds.device)
+    valid_count = 0
+
+    # ===== PERTE SUPERVISÉE (DICE) =====
+    for t in range(T):
+        valid = mask[t]  # booleen [B]
+        if valid.any():
+            logits_t = preds[t, valid]  # [n_valid, C, H, W]
+            targets_t = Y[t, valid]     # [n_valid, H, W]
+            loss_dice = dice_criterion(logits_t, targets_t)
+            sup_loss += loss_dice
+            valid_count += valid.sum()
+
+    sup_loss = sup_loss / max(valid_count, 1)
+
+    # ===== CONSISTANCE TEMPORELLE (facultative) =====
+    preds_soft = F.softmax(preds, dim=2)  # [T, B, C, H, W]
+    temp_loss = torch.tensor(0., device=preds.device)
+    if T > 1:
+        for t in range(T - 1):
+            p_t   = preds_soft[t]
+            p_t1  = preds_soft[t+1]
+            log_p = torch.log(p_t + 1e-8)
+            log_q = torch.log(p_t1 + 1e-8)
+            kl_pq = F.kl_div(log_p, p_t1, reduction='batchmean')
+            kl_qp = F.kl_div(log_q, p_t,  reduction='batchmean')
+            temp_loss += (kl_pq + kl_qp) / 2
+        temp_loss /= (T - 1)
+
+    return sup_loss + lambda_temp * temp_loss
